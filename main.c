@@ -1092,6 +1092,7 @@ char** getdirs(const char* currentdir, char* folder, int* count) {
 
 
 int argparse(int argc, char **argv) {
+    optind = 0; // Reset getopt state for re-entrancy (0 is safer on some systems to force re-scan)
     cfg.master = NULL;
     cfg.output = false;
     cfg.index = 1;

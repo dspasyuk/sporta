@@ -86,6 +86,29 @@ If no arguments are provided, SPORTA defaults to scanning the current directory 
 -   `-g <sigma>`: Set the Gaussian filtering sigma value (default: various).
 -   `-o`: Enable output of intermediate PGM images (`pre-output.pgm`, `post-output.pgm`).
 
+## Python API
+
+You can also use SPORTA as a Python library to process files programmatically.
+
+```python
+import sporta
+
+# Process a single file
+result = sporta.process_file("/path/to/data.h5", index=1, threshold=6.0)
+print(result)
+
+# Result is a dictionary containing resolution, spot count, etc.
+# {
+#     'File': '...',
+#     'Resolution': 3.88,
+#     '# Spots': 27,
+#     ...
+# }
+```
+
+This allows for easy integration into batch processing pipelines or data analysis scripts.
+
+
 ## Output
 
 The tool prints analysis results to the console and saves a summary to `data.tsv`.

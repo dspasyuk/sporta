@@ -5,24 +5,49 @@ import pandas as pd
 
 import glob
 
-# Try to find the setuptools-built library first (sporta_lib*.so)
-# This handles cases where it's installed as a package or built in-place
+# Try to find the shared library
 lib_path = None
-lib_files = glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sporta_lib*.so"))
-if lib_files:
-    lib_path = lib_files[0]
-else:
-    # Fallback to manual build name
-    manual_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sporta.so")
-    if os.path.exists(manual_path):
-        lib_path = manual_path
+
+# 1. Look in current directory (local build/dev)
+local_lib = glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sporta_lib*.so"))
+if local_lib:
+    lib_path = local_lib[0]
+
+# 2. Look in site-packages (installed via pip)
+if lib_path is None:
+    try:
+        import sysconfig
+        # Construct expected name or pattern
+        # This is tricky because extension naming varies by platform/python version
+        # But we can look relative to where this file is installed
+        # If sporta.py is in site-packages, the .so should be next to it
+        installed_lib = glob.glob(os.path.join(os.path.dirname(__file__), "sporta_lib*.so"))
+        if installed_lib:
+            lib_path = installed_lib[0]
+            
+        # 3. Fallback: manual build name
+        if lib_path is None:
+             manual_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sporta.so")
+             if os.path.exists(manual_path):
+                 lib_path = manual_path
+                 
+    except Exception:
+        pass
 
 if lib_path is None:
-    # If installed via pip, the .so might be in the package directory (which is this directory)
-    # but named differently or not found if we are running from source without build
-    # Try finding it in site-packages if we are imported?
-    # For now, just raise error or assume current directory
-     raise FileNotFoundError("Could not find sporta_lib shared library. Did you run 'pip install .' or 'python setup.py build_ext --inplace'?")
+    # 4. Global fallback
+    # Maybe we are running a script that imports sporta, and sporta is installed in site-packages
+    # We can try to import the extension module directly to get its file?
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("sporta_lib")
+        if spec and spec.origin:
+            lib_path = spec.origin
+    except ImportError:
+        pass
+
+if lib_path is None:
+     raise FileNotFoundError("Could not find sporta_lib shared library. Please install the package with 'pip install .'")
 
 lib = ctypes.CDLL(lib_path)
 
@@ -65,9 +90,69 @@ def getdirs(currentdir, folder):
 lib.screener.restype = ctypes.c_int
 lib.screener.argtypes = [ctypes.c_char_p]
 
+def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, output=False):
+    """
+    Process a single HDF5 file or master file.
+    
+    Args:
+        filename (str): Path to the .h5 file.
+        index (int): Frame index to process (1-based, default: 1).
+        threshold (float): Threshold scale factor (default: 6).
+        proximity (float): Ring exclusion proximity radius (default: 2).
+        gaussian (float): Gaussian sigma (optional).
+        output (bool): Whether to save intermediate PGM images (default: False).
+        
+    Returns:
+        dict: A dictionary containing the analysis results (Resolution, Spot Count, etc.)
+    """
+    abs_path = os.path.abspath(filename)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(f"File not found: {abs_path}")
+        
+    # Construct arguments for argparse
+    # argparse expects [program_name, arg1, val1, ...]
+    args = ["sporta"]
+    args.extend(["-t", str(threshold)])
+    args.extend(["-e", str(proximity)])
+    args.extend(["-i", str(index)])
+    if gaussian is not None:
+        args.extend(["-g", str(gaussian)])
+    if output:
+        args.append("-o")
+        
+    # Convert to C-compatible argv
+    argc = len(args)
+    c_args = (ctypes.c_char_p * (argc + 1))()
+    c_args[:-1] = [arg.encode('utf-8') for arg in args]
+    c_args[-1] = None
+    
+    # Update global config in C
+    lib.argparse(argc, c_args)
+    
+    # Run analysis
+    res = lib.screener(abs_path.encode())
+    if res != 0:
+        raise RuntimeError(f"Analysis failed for {abs_path}")
+        
+    # Retrieve results
+    header = lib.getheaderdata()
+    return {
+        'File': abs_path,
+        'Resolution': header.resolution,
+        'Distance': header.distance,
+        'Wavelength': header.wavelength,
+        'Threshold': header.threshold,
+        '# Spots': header.num_spots,
+        'Intensity': header.intensity,
+        'Ice': header.ice,
+        'Max Radius': header.max_distance,
+        'SNR': header.snr,
+    }
+
 def main():
     args = sys.argv
     argc = len(args)
+    # ... rest of main ...
     
     # Separate flags and files
     # Pass all args to argparse to set flags
