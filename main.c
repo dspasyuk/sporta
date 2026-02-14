@@ -882,6 +882,11 @@ char* generatemaster(const char* filename) {
         printf("File %s does not exist.\n", filename);
         return NULL;
     }
+    
+    // If the file is already a master file, return it
+    if (strstr(filename, "_master.h5") != NULL) {
+        return strdup(filename);
+    }
 
     // Copy the filename to a new variable that we can modify
     static char master[256];
@@ -891,11 +896,12 @@ char* generatemaster(const char* filename) {
     // Find the last occurrence of "_data_" in the filename
     char *substring = strstr(master, "_data_");
     if (substring == NULL) {
-        printf("Invalid filename format.\n");
+        // Fallback: assume it might be a master file named differently or user error
+        // But for now, just print error as before if it doesn't match expected pattern
+        printf("Invalid filename format. Expected '_data_' or '_master.h5'\n");
         return NULL;
     }
 
-    // Replace "_data_" and everything after it with "_master.h5"
     // Replace "_data_" and everything after it with "_master.h5"
     memcpy(substring, "_master.h5", strlen("_master.h5"));
     // Make sure the new filename string is properly terminated
@@ -957,7 +963,21 @@ int screener(const char *filename){
         setdefault();
     }
     
-    double *data = decompresshdf5(filename, cfg.data, cfg.index);
+    char dataset_path[256];
+    // If input is a master file, constructing the dataset path is tricky because it relies on how the master links to data.
+    // However, usually master files have links like /entry/data/data_000001
+    if (strstr(filename, "_master.h5") != NULL) {
+        snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+    } else {
+        strncpy(dataset_path, cfg.data, sizeof(dataset_path));
+    }
+    
+    double *data = decompresshdf5(filename, dataset_path, cfg.index);
+    if (data == NULL) {
+        fprintf(stderr, "Failed to decompress/read HDF5 data from %s (dataset: %s)\n", filename, dataset_path);
+        return 1;
+    }
+    
     img.height = (int)header.size[0];
     img.width = (int)header.size[1];
     img.data = deepcopyimage(data, img.width, img.height);
