@@ -81,6 +81,10 @@ If no arguments are provided, SPORTA defaults to scanning the current directory 
     ```bash
     sporta -i 5 image.h5
     ```
+-   `-r <start>-<end>`: Process a range of frames (inclusive) within the HDF5 file.
+    ```bash
+    sporta -r 1-10 image_master.h5
+    ```
 -   `-t <value>`: Set the threshold scale factor (default: 6).
 -   `-e <value>`: Set the ring exclusion proximity radius (default: 2).
 -   `-g <sigma>`: Set the Gaussian filtering sigma value (default: various).

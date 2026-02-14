@@ -152,85 +152,157 @@ def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, out
 def main():
     args = sys.argv
     argc = len(args)
-    # ... rest of main ...
     
     # Separate flags and files
-    # Pass all args to argparse to set flags
-    c_args = (ctypes.c_char_p * (argc + 1))()
-    c_args[:-1] = [arg.encode('utf-8') for arg in args]
-    c_args[-1] = None
+    # We need to intercept -r range argument and handle it in Python
+    filtered_args = []
     
-    lib.argparse(argc, c_args)
+    range_start = 1
+    range_end = 1
+    has_range = False
     
-    # Identify explicit file arguments (ignoring flags and their values)
-    # This is a simple heuristic: arguments that don't start with '-' and aren't values of flags
-    # But for simplicity, let's just use what argparse didn't consume? 
-    # lib.argparse doesn't return consumed args. 
-    # Let's check for files in args that exist on disk or match patterns
-    
-    files_to_process = []
-    
-    # Skip argv[0] (program name)
     i = 1
     while i < argc:
         arg = args[i]
-        if arg.startswith('-'):
-            # It's a flag. 
-            # Simple assumption: flags like -f, -i, -d, -t, -s, -e, -g take an argument.
-            # -h, -o, -r, -p, -n do not.
-            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g']:
-                i += 2 # Skip flag and value
+        if arg == '-r':
+            if i + 1 < argc:
+                r_arg = args[i+1]
+                try:
+                    parts = r_arg.split('-')
+                    if len(parts) == 2:
+                        range_start = int(parts[0])
+                        range_end = int(parts[1])
+                        has_range = True
+                    else:
+                        print(f"Invalid range format: {r_arg}. Expected start-end (e.g. 1-10)")
+                        sys.exit(1)
+                except ValueError:
+                    print(f"Invalid range values: {r_arg}")
+                    sys.exit(1)
+                i += 2
+                continue
             else:
-                i += 1 # Skip flag
+                print("Missing range argument after -r")
+                sys.exit(1)
+        
+        filtered_args.append(arg)
+        # Skip values for other flags to avoid double adding
+        if arg.startswith('-'):
+            # These flags take an argument
+            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g']:
+                if i + 1 < argc:
+                    filtered_args.append(args[i+1])
+                    i += 2
+                else:
+                    i += 1
+            else:
+                i += 1
         else:
-            # It's potential file or glob
-            # Glob expansion is done by shell usually, so sys.argv has the list.
+            i += 1
+
+    # Reconstruct argv for C without -r
+    # We will override -i manually if range is set
+    c_argv_base = ["sporta"] + filtered_args
+    
+    # Identify files to process (same logic as before but now using filtered_args)
+    files_to_process = []
+    i = 0
+    while i < len(filtered_args):
+        arg = filtered_args[i]
+        if arg.startswith('-'):
+            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g']:
+                i += 2
+            else:
+                i += 1
+        else:
             files_to_process.append(arg)
             i += 1
             
-    data_list = []
+    # Logic for when files exist OR we want to support range on files
+    has_processed = False
     
     if files_to_process:
-        # Process explicit files
-        for f in files_to_process:
-            # Check if directory -> use getdirs logic? Or just skip?
-            # User intent: 'sporta file.h5' -> process file.
-            if os.path.isdir(f):
-                # If directory provided as arg, scan it?
-                d_files = getdirs(f, "data") # This looks for "data" folder inside or similar?
-                # Existing getdirs logic is specific. Let's assume user passes actual files or directories to scan.
-                # But getdirs(currentdir, "data") implies folder name to look for.
-                pass 
-            else:
-                # Process file
-                # Need to use absolute path for safety if C code expects it?
-                abs_path = os.path.abspath(f)
-                header = Hdf5Header()
-                # screener processes the file and sets header
-                # We need to ensure we don't need getrecentfile logic (regex check)
-                res = lib.screener(abs_path.encode())
-                
-                header = lib.getheaderdata()
-                header_dict = {
-                    'File': abs_path,
-                    'Resolution': header.resolution,
-                    'Distance': header.distance,
-                    'Wavelength': header.wavelength,
-                    'Threshold': header.threshold,
-                    '# Spots': header.num_spots,
-                    'Intensity': header.intensity,
-                    'Ice': header.ice,
-                }
-                data_list.append(header_dict)
-                
-    else:
-        # Fallback to default directory scanning
-        currentdir = os.getcwd()
-        directories = getdirs(currentdir, "data")
+        collected_results = []
         
+        # Determine index list
+        indices = range(range_start, range_end + 1) if has_range else [None]
+        
+        for f in files_to_process:
+            if os.path.isdir(f):
+                 # Directory logic not fully implemented in this python wrapper for range?
+                 # Ignoring for now, focusing on master files
+                 pass
+            else:
+                abs_path = os.path.abspath(f)
+                
+                for idx in indices:
+                    # Construct args for this iteration
+                    current_argv = list(c_argv_base)
+                    
+                    if idx is not None:
+                        # Find if -i is already there and replace it, or append it
+                        if '-i' in current_argv:
+                            idx_pos = current_argv.index('-i')
+                            current_argv[idx_pos+1] = str(idx)
+                        else:
+                            current_argv.extend(['-i', str(idx)])
+                            
+                    # Update C config
+                    c_argc = len(current_argv)
+                    c_args = (ctypes.c_char_p * (c_argc + 1))()
+                    c_args[:-1] = [arg.encode('utf-8') for arg in current_argv]
+                    c_args[-1] = None
+                    
+                    lib.argparse(c_argc, c_args)
+                    
+                    res = lib.screener(abs_path.encode())
+                    
+                    if res == 0: # Success
+                        header = lib.getheaderdata()
+                        collected_results.append({
+                            'File': abs_path,
+                            'Frame': idx if idx is not None else 1, # approximate if not set
+                            'Resolution': header.resolution,
+                            '# Spots': header.num_spots,
+                            'Ice': header.ice,
+                            'Distance': header.distance,
+                            'Wavelength': header.wavelength,
+                            'Threshold': header.threshold,
+                            'Intensity': header.intensity
+                        })
+                        has_processed = True
+
+        if collected_results:
+            df = pd.DataFrame(collected_results)
+            # Reorder columns slightly for better view
+            cols = ['File', 'Frame', 'Resolution', '# Spots', 'Ice', 'Distance', 'Wavelength', 'Threshold', 'Intensity']
+            # Only existing columns
+            cols = [c for c in cols if c in df.columns]
+            print("\nBatch Results:")
+            print(df[cols])
+            df.to_csv('data.tsv', sep='\t', index=False)
+            print("SAVED FILE data.tsv")
+
+    if not has_processed and not files_to_process:
+        # Fallback to default directory scanning if no files provided
+        if has_range:
+             print("Warning: Range -r specified but no files provided. Range ignored for directory scan.")
+         
+        c_args = (ctypes.c_char_p * (len(c_argv_base) + 1))()
+        c_args[:-1] = [arg.encode('utf-8') for arg in c_argv_base]
+        c_args[-1] = None
+        lib.argparse(len(c_argv_base), c_args)
+         
+        current_directory = os.getcwd()
+        # Use getdirs logic via C or Python? 
+        # The previous code had specific logic.
+        # But for maintenance, let's rely on C's getrecentfile behavior which iterates directory
+        directories = getdirs(current_directory, "data")
+        
+        data_list = []
         for d in directories:
             header = Hdf5Header()
-            lib.getrecentfile(d.encode()) # getrecentfile calls screener internally for 'correct' files
+            lib.getrecentfile(d.encode()) 
             header = lib.getheaderdata()
             
             header_dict = {
@@ -245,15 +317,10 @@ def main():
             }
             data_list.append(header_dict)
             
-    df = pd.DataFrame(data_list)
-    df = df[df['Resolution'] != 0]
-    
-    print(df)
-    
-    namefile = 'data.tsv'
-    df.to_csv(namefile, sep='\t', index=False)
-    
-    print("SAVED FILE", namefile)
+        if len(data_list) > 0:
+            df = pd.DataFrame(data_list)
+            df.to_csv('data.tsv', sep='\t', index=False)
+            print("SAVED FILE data.tsv")
 
 if __name__ == "__main__":
     main()
