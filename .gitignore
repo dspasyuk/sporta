@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.so
+*.o
+*.a
+*.pyc
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+output.txt
+data.tsv
+*.pgm
+histogram_data.txt
+image_data.txt
+libs/
+data/
