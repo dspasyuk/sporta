@@ -103,6 +103,8 @@ typedef struct PositionSet {
     struct PositionSet* next;
 } PositionSet;
 
+double calculateresolution(double radius);
+
 PositionSet* positionSets = NULL;
 Hdf5Header header;
 Image img;
@@ -125,19 +127,44 @@ void printconfig(config cfg) {
 
 void printheader(const Hdf5Header* header) {
     printf("=================================HEADER============================== \n");
-    printf("Distance: %f\n", header->distance);
-    printf("Wavelength: %f\n", header->wavelength);
-    printf("Beam Center: (%f, %f)\n", header->beam_center[0], header->beam_center[1]);
-    printf("Size: (%f, %f)\n", header->size[0], header->size[1]);
-    printf("Pixel Size: %f\n", header->psize);
+    printf("Detector Distance: %.4f m\n", header->distance);
+    printf("Wavelength:        %.4f Å\n", header->wavelength);
+    printf("Beam Center:       (%.2f, %.2f) pixels\n", header->beam_center[0], header->beam_center[1]);
+    printf("Image Size:        (%.0f, %.0f) pixels\n", header->size[0], header->size[1]);
+    printf("Pixel Size:        %.6f m\n", header->psize);
     printf("==================================INFO=============================== \n");
-    printf("Pre-Mod Intensity: %f\n", img.preintensity);
-    printf("Post-Mod Intensity: %f\n", header->postintensity);
-    printf("Threshold: %f\n", header->threshold);
-    printf("SNR: %f\n", header->snr);
-    printf("Max Radius: %f\n", header->max_distance);
-    printf("\033[1;31mResolution: %f\033[0m\n", header->resolution);
-    printf("\033[1;31mSpot Count: %d\033[0m\n", header->num_spots);
+    printf("Avg Raw Intensity:       %.2f\n", img.preintensity);
+    printf("Avg Processed Intensity: %.2f\n", header->postintensity);
+    printf("Threshold Value:         %.2f\n", header->threshold);
+    printf("Signal Quality (LogSNR): %.2f\n", header->snr);
+    
+    // Calculate values in mm
+    double max_radius_mm = header->max_distance * header->psize * 1000.0;
+    printf("Farthest Spot Radius:    %.2f mm (%.2f pixels)\n", max_radius_mm, header->max_distance);
+    printf("\033[1;31mBest Spot Resolution:    %.2f Å\033[0m\n", header->resolution);
+    
+    // Calculate Edge Resolution
+    // Explore all 4 corners to find max radius
+    double h = header->size[0];
+    double w = header->size[1];
+    double bc0 = header->beam_center[0];
+    double bc1 = header->beam_center[1];
+    
+    double d1 = sqrt(pow(0 - bc0, 2) + pow(0 - bc1, 2));
+    double d2 = sqrt(pow(h - bc0, 2) + pow(0 - bc1, 2));
+    double d3 = sqrt(pow(0 - bc0, 2) + pow(w - bc1, 2));
+    double d4 = sqrt(pow(h - bc0, 2) + pow(w - bc1, 2));
+    
+    double edge_radius = d1;
+    if (d2 > edge_radius) edge_radius = d2;
+    if (d3 > edge_radius) edge_radius = d3;
+    if (d4 > edge_radius) edge_radius = d4;
+    
+    double edge_res = calculateresolution(edge_radius);
+    
+    printf("Detector Edge Resolution: %.2f Å\n", edge_res);
+    printf("\033[1;31mSpot Count:              %d\033[0m\n", header->num_spots);
+    
     PositionSet* currentSet = positionSets;
     int groupNumber = 1;
 
@@ -146,7 +173,7 @@ void printheader(const Hdf5Header* header) {
     }
     else{
         while (currentSet != NULL) {
-            printf("Ice Ring %d: %f-%f\n", groupNumber, currentSet->startPosition, currentSet->endPosition);
+            printf("Ice Ring %d: %.2f-%.2f Å\n", groupNumber, currentSet->startPosition, currentSet->endPosition);
             currentSet = currentSet->next;
             groupNumber++;
         }
