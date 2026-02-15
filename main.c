@@ -134,7 +134,7 @@ void printheader(const Hdf5Header* header) {
     printf("Pixel Size:        %.6f m\n", header->psize);
     printf("==================================INFO=============================== \n");
     printf("Avg Raw Intensity:       %.2f\n", img.preintensity);
-    printf("Avg Processed Intensity: %.2f\n", header->postintensity);
+    printf("Avg Spot Intensity:      %.2f\n", header->postintensity);
     printf("Threshold Value:         %.2f\n", header->threshold);
     printf("Signal Quality (LogSNR): %.2f\n", header->snr);
     
@@ -441,15 +441,18 @@ void addringset(PositionSet** head, double startPosition, double endPosition) {
 }
 
 double calculateavgintensity(double* image, int width, int height, double thresfactor) {
-    int totalPixels = width * height;
-    int sum = 0;
-    unsigned char pixelValue;
+    long long totalPixels = (long long)width * height;
+    double sum = 0;
     for (int i = 0; i < totalPixels; i++) {
-        pixelValue = image[i];
-        if (image[i] > 255) pixelValue = 0;
-        sum += pixelValue;
+        // Use the full double value, no truncation or 8-bit clipping
+        // We assume valid data is passed. 
+        // If there are sentinel values (like -1 for masking), they should be handled, 
+        // but looking at usage, it seems to be raw data or binary mask.
+        // The original code clipped > 255 to 0. We remove this for high dynamic range support.
+        sum += image[i];
     }
-    return (double) sum / totalPixels * thresfactor;
+    if (totalPixels == 0) return 0;
+    return (sum / totalPixels) * thresfactor;
 }
 
 
@@ -457,7 +460,9 @@ void intensityanalysis(double data[], int width, int height) {
     header.resolution = calculateresolution(header.max_distance);
     int newSize = (img.height + img.width) / 2;  // Modify the variable name to avoid confusion
     double max = 10;
-    double mean = header.postintensity;
+    // double mean = header.postintensity; // This was used for ceiling but postintensity is now spot intensity. 
+    // We should use preintensity (raw avg) or just local calculation for ring detection thresholds.
+    double mean = img.preintensity; 
     double ceiling = mean * 150;
 
     // unsigned char circle_color = 255;
@@ -740,7 +745,10 @@ void plot3DImage(Spot** spots, int width, int height) {
 void applySPORTA(double* image, double* data, int height, int width){
     int num_spots = 0;
     double radial[img.height + img.width], postradial[img.height + img.width];
-    header.postintensity = calculateavgintensity(img.data, width, height, 1);
+    
+    // We remove the old binary mask intensity calculation that resulted in 0.00
+    // header.postintensity = calculateavgintensity(img.data, width, height, 1);
+    
     Spot** spots = connectedcomponentanalysis(height, width, image, data, radial, postradial, &num_spots);
     header.num_spots = num_spots;
 
@@ -759,17 +767,20 @@ void applySPORTA(double* image, double* data, int height, int width){
     // Spot* furthest_spot = NULL;
     double max_distance_from_center = 0;
 
-    long totalintensity = 0;
+    double totalintensity = 0; // Use double for intensity
 
     for (int i = 0; i < num_spots; i++) {
         int totalX = 0;
         int totalY = 0;
         int num = spots[i]->num_pixels;
         for (int k = 0; k < num; k++) {
-            totalintensity += spots[i]->intensity;
             totalX += spots[i]->x_coords[k];
             totalY += spots[i]->y_coords[k];
         }
+        
+        // Sum intensity for this spot
+        totalintensity += spots[i]->intensity;
+        
         int aX = (int)(totalX / num);
         int aY = (int)(totalY / num);
         if (spots[i]->cluster_id == 0) {
@@ -785,6 +796,17 @@ void applySPORTA(double* image, double* data, int height, int width){
             drawcircle(image, 10, width, height, aX, aY, circle_color);
         }
     }
+    
+    // Update header postintensity to be Avg Spot Intensity
+    if(num_spots > 0) {
+        header.postintensity = totalintensity / num_spots;
+    } else {
+        header.postintensity = 0.0;
+    }
+    
+    // Set header.intensity to Total Integrated Intensity
+    header.intensity = totalintensity;
+    
     header.snr = log10(header.num_spots / img.preintensity);
     header.max_distance = max_distance_from_center * 0.95;
     if (cfg.output){
