@@ -117,6 +117,13 @@ This allows for easy integration into batch processing pipelines or data analysi
 
 The tool prints analysis results to the console and saves a summary to `data.tsv`.
 
+### Metrics Definitions
+
+-   **Total Intensity**: Sum of intensities of all pixels within identified spots.
+-   **Avg Spot Intensity**: Average intensity per spot (Total Intensity / Spot Count).
+-   **Avg Raw Intensity**: Average pixel intensity of the entire raw image.
+-   **Signal Quality (LogSNR)**: Logarithmic signal-to-noise ratio based on spot count vs raw intensity.
+
 ## License
 
 MIT License
