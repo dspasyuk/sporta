@@ -1013,15 +1013,62 @@ int screener(const char *filename){
     }
     
     char dataset_path[256];
-    // If input is a master file, constructing the dataset path is tricky because it relies on how the master links to data.
-    // However, usually master files have links like /entry/data/data_000001
+    int read_index = cfg.index; // Default to using configured index directly (if not master/chunked)
+
+    // Robust dataset determination logic
     if (strstr(filename, "_master.h5") != NULL) {
-        snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+        hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
+        if (file_id >= 0) {
+            // Priority 1: Check for consolidated 'data' dataset
+            if (H5Lexists(file_id, "/entry/data/data", H5P_DEFAULT) > 0) {
+                strcpy(dataset_path, "/entry/data/data");
+                read_index = cfg.index - 1; // 1-based to 0-based
+                if (read_index < 0) read_index = 0;
+            } 
+            // Priority 2: Check for chunked 'data_000001'
+            else if (H5Lexists(file_id, "/entry/data/data_000001", H5P_DEFAULT) > 0) {
+                 hid_t dset = H5Dopen(file_id, "/entry/data/data_000001", H5P_DEFAULT);
+                 if (dset >= 0) {
+                     hid_t space = H5Dget_space(dset);
+                     hsize_t dims[3];
+                     H5Sget_simple_extent_dims(space, dims, NULL);
+                     H5Sclose(space);
+                     H5Dclose(dset);
+                     
+                     int chunk_size = (int)dims[0]; // typically 100 or 1000
+                     if (chunk_size > 0) {
+                         int eff_index = cfg.index - 1; // 1-based to 0-based
+                         if (eff_index < 0) eff_index = 0;
+                         
+                         int chunk_id = (eff_index / chunk_size) + 1;
+                         int local_idx = eff_index % chunk_size;
+                         
+                         snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", chunk_id);
+                         read_index = local_idx;
+                     } else {
+                         // Fallback if dim is 0?
+                         snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+                     }
+                 } else {
+                     snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+                 }
+            } else {
+                // Fallback: simple numeric mapping (old behavior)
+                snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+            }
+            H5Fclose(file_id);
+        } else {
+             // File open failed, but let decompresshdf5 handle error reporting
+             snprintf(dataset_path, sizeof(dataset_path), "/entry/data/data_%06d", cfg.index);
+        }
     } else {
         strncpy(dataset_path, cfg.data, sizeof(dataset_path));
+        // If not master, we assume single file, maybe 1-based index needs offset?
+        // Old code used cfg.index directly. Let's keep it but ideally it should be -1 if 1-based.
+        // For compatibility with old behavior on single files, we keep cfg.index unless we are sure.
     }
     
-    double *data = decompresshdf5(filename, dataset_path, cfg.index);
+    double *data = decompresshdf5(filename, dataset_path, read_index);
     if (data == NULL) {
         fprintf(stderr, "Failed to decompress/read HDF5 data from %s (dataset: %s)\n", filename, dataset_path);
         return 1;
