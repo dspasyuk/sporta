@@ -129,3 +129,7 @@ The tool prints analysis results to the console. If `-v` is used, it also saves 
 ## License
 
 MIT License
+
+## Acknowledgments
+
+Special thanks to Aaryan Patel for significant contributions to the development of this code.
