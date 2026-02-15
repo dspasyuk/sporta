@@ -77,6 +77,7 @@ If no arguments are provided, SPORTA defaults to scanning the current directory 
 
 ### Options
 
+-   `-v`: Verbose mode. Enables saving of analysis results to `data.tsv`.
 -   `-i <index>`: Set the internal frame index to process within the HDF5 file (default: 1).
     ```bash
     sporta -i 5 image.h5
@@ -89,6 +90,7 @@ If no arguments are provided, SPORTA defaults to scanning the current directory 
 -   `-e <value>`: Set the ring exclusion proximity radius (default: 2).
 -   `-g <sigma>`: Set the Gaussian filtering sigma value (default: various).
 -   `-o`: Enable output of intermediate PGM images (`pre-output.pgm`, `post-output.pgm`).
+-   `-h`: Display help message.
 
 ## Python API
 
@@ -115,7 +117,7 @@ This allows for easy integration into batch processing pipelines or data analysi
 
 ## Output
 
-The tool prints analysis results to the console and saves a summary to `data.tsv`.
+The tool prints analysis results to the console. If `-v` is used, it also saves a summary to `data.tsv`.
 
 ### Metrics Definitions
 

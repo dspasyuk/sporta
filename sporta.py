@@ -149,6 +149,21 @@ def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, out
         'SNR': header.snr,
     }
 
+def print_help():
+    print("Usage: sporta [options] [files...]")
+    print("\nOptions:")
+    print("  -h          Display this help message")
+    print("  -v          Verbose mode: Save analysis results to 'data.tsv'")
+    print("  -r <start>-<end>  Process a range of frames (e.g., 1-100)")
+    print("  -i <index>  Set the frame index to process (default: 1)")
+    print("  -t <value>  Set the threshold scale factor (default: 6)")
+    print("  -e <value>  Set the ring exclusion proximity radius (default: 2)")
+    print("  -g <sigma>  Set the Gaussian filtering sigma value")
+    print("  -o          Enable intermediate image output")
+    print("\nExamples:")
+    print("  sporta -v data.h5")
+    print("  sporta -r 1-10 -v data_master.h5")
+
 def main():
     args = sys.argv
     argc = len(args)
@@ -160,10 +175,21 @@ def main():
     range_start = 1
     range_end = 1
     has_range = False
+    verbose = False
     
     i = 1
     while i < argc:
         arg = args[i]
+        
+        if arg == '-h':
+            print_help()
+            sys.exit(0)
+            
+        if arg == '-v':
+            verbose = True
+            i += 1
+            continue
+
         if arg == '-r':
             if i + 1 < argc:
                 r_arg = args[i+1]
@@ -200,7 +226,7 @@ def main():
         else:
             i += 1
 
-    # Reconstruct argv for C without -r
+    # Reconstruct argv for C without -r or -v
     # We will override -i manually if range is set
     c_argv_base = ["sporta"] + filtered_args
     
@@ -272,7 +298,7 @@ def main():
                         })
                         has_processed = True
 
-        if collected_results:
+        if collected_results and verbose:
             df = pd.DataFrame(collected_results)
             # Reorder columns slightly for better view
             cols = ['File', 'Frame', 'Resolution', '# Spots', 'Ice', 'Distance', 'Wavelength', 'Threshold', 'Intensity']
@@ -317,7 +343,7 @@ def main():
             }
             data_list.append(header_dict)
             
-        if len(data_list) > 0:
+        if len(data_list) > 0 and verbose:
             df = pd.DataFrame(data_list)
             df.to_csv('data.tsv', sep='\t', index=False)
             print("SAVED FILE data.tsv")
