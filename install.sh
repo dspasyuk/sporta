@@ -31,14 +31,7 @@ pip install --upgrade pip setuptools wheel
 # 4. Install the package
 echo "Installing SPORTA and dependencies..."
 
-# Special handling for current environment if needed (optional, keeping generic)
-if [ -d "/home/denis/gsas2main" ]; then
-    echo "Detected gsas2main. Using it for HDF5 paths."
-    export HDF5_HOME="/home/denis/gsas2main"
-fi
-
-# Install in editable mode for development, or standard install
-# Using pip install . builds the C extension
+# Install the package (builds the C extension)
 pip install .
 
 echo "--------------------------------------------------------"

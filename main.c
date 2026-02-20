@@ -1,6 +1,6 @@
 /**
     SPORTA: Spot Detection & Screening of X-Ray Diffraction Images​
-    Copyright (c) 2023, Aaryan Patel
+    Copyright (c) 2023, Denis SPasyuk, Aaryan Patel
 
     MIT LICENSE
 
@@ -23,8 +23,6 @@
     Acknowledgments:
     Canadian Light Source 
     Industrial Science
-    Denis Spasyuk
-
 */
 
 #include <stdio.h>
@@ -50,6 +48,7 @@ typedef struct {
     int height;
     double** pixels;
     double preintensity;
+    int* mask; 
 } Image;
 
 typedef struct {
@@ -67,6 +66,7 @@ typedef struct {
     double max_distance;
     double snr;
     double postintensity;
+    double resolution_95; // New metric
 } Hdf5Header;
 
 typedef struct {
@@ -83,6 +83,7 @@ typedef struct {
     bool gnu;
     double gaussian;
     char path;
+    int min_pixel_size;
 } config;
 
 typedef struct {
@@ -142,6 +143,9 @@ void printheader(const Hdf5Header* header) {
     double max_radius_mm = header->max_distance * header->psize * 1000.0;
     printf("Farthest Spot Radius:    %.2f mm (%.2f pixels)\n", max_radius_mm, header->max_distance);
     printf("\033[1;31mBest Spot Resolution:    %.2f Å\033[0m\n", header->resolution);
+    if(header->resolution_95 > 0) {
+        printf("Resolution (95%%):       %.2f Å\n", header->resolution_95);
+    }
     
     // Calculate Edge Resolution
     // Explore all 4 corners to find max radius
@@ -169,7 +173,12 @@ void printheader(const Hdf5Header* header) {
     int groupNumber = 1;
 
     if (currentSet == NULL){
-        printf("Ice Ring: NONE\n");
+        // Check if ice was flagged by hard filter even if no rings were added to list
+        if (header->ice) {
+             printf("Ice Ring: DETECTED (Hard Filter)\n");
+        } else {
+             printf("Ice Ring: NONE\n");
+        }
     }
     else{
         while (currentSet != NULL) {
@@ -211,27 +220,29 @@ void savepgm(const char* filename, double* data, int width, int height) {
     fprintf(file, "%d %d\n", width, height);
     fprintf(file, "255\n");
     if (strcmp(filename, "pre-output") == 0){
-    // Write the inverted image data
+        // Write the inverted image data
         for (int i = 0; i < height; i++) {
             for (int j = 0; j < width; j++) {
                 int value = (int)(data[i * width + j]);
-                if (value < 0 || value > 1000) {
-                    value = 0;
-                }
-                fprintf(file, "%d ", value);
+                // Clamp to 0-255
+                if (value < 0) value = 0;
+                if (value > 255) value = 255;
+                // Invert
+                fprintf(file, "%d ", 255 - value);
             }
             fprintf(file, "\n");
         }
     }
     else {
-        // Write the inverted image data
+        // Write the inverted image data for post-output
         for (int i = 0; i < height; i++) {
             for (int j = 0; j < width; j++) {
                 int value = (int)(data[i * width + j]);
-                if (data[i * width + j] > 10000 && data[i * width + j] < 0) {
-                    value = 0;
-                }
-                fprintf(file, "%d ", value);
+                // Clamp to 0-255
+                if (value < 0) value = 0;
+                if (value > 255) value = 255;
+                // Invert
+                fprintf(file, "%d ", 255 - value);
             }
             fprintf(file, "\n");
         }
@@ -349,6 +360,21 @@ void readhdf5(const char* filename){
     psize_id = H5Dopen2(detector_id, "x_pixel_size", H5P_DEFAULT);
     H5Dread(psize_id, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &header.psize);
     H5Dclose(psize_id);
+    
+    // Read Pixel Mask if available
+    img.mask = NULL;
+    if (H5Lexists(file_id, "/entry/instrument/detector/detectorSpecific/pixel_mask", H5P_DEFAULT) > 0) {
+        hid_t mask_id = H5Dopen(file_id, "/entry/instrument/detector/detectorSpecific/pixel_mask", H5P_DEFAULT);
+        if (mask_id >= 0) {
+            img.mask = (int*)malloc(header.size[0] * header.size[1] * sizeof(int));
+            if (H5Dread(mask_id, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT, img.mask) < 0) {
+                printf("Warning: Failed to read pixel mask.\n");
+                free(img.mask);
+                img.mask = NULL;
+            }
+            H5Dclose(mask_id);
+        }
+    }
 }
 
 Spot* create_spot(int label, int num_pixels) {
@@ -440,99 +466,551 @@ void addringset(PositionSet** head, double startPosition, double endPosition) {
     *head = newPositionSet;
 }
 
-double calculateavgintensity(double* image, int width, int height, double thresfactor) {
+double calculateavgintensity(double* image, int* mask, int width, int height, double thresfactor) {
     long long totalPixels = (long long)width * height;
+    
+    // Robust mean calculation using sigma clipping to ignore Bragg peaks
     double sum = 0;
+    long long count = 0;
+    double sum_sq = 0;
+    
+    // Pass 1: Initial Mean/Std (ignoring masked pixels)
     for (int i = 0; i < totalPixels; i++) {
-        // Use the full double value, no truncation or 8-bit clipping
-        // We assume valid data is passed. 
-        // If there are sentinel values (like -1 for masking), they should be handled, 
-        // but looking at usage, it seems to be raw data or binary mask.
-        // The original code clipped > 255 to 0. We remove this for high dynamic range support.
-        sum += image[i];
+        if (mask && mask[i] != 0) continue; // Skip bad pixels
+        // Also skip very high values directly? No, let stats handle it first
+        double val = image[i];
+        sum += val;
+        sum_sq += val * val;
+        count++;
     }
-    if (totalPixels == 0) return 0;
-    return (sum / totalPixels) * thresfactor;
+    
+    if (count == 0) return 0;
+    
+    double mean = sum / count;
+    double variance = (sum_sq / count) - (mean * mean);
+    double std_dev = sqrt(variance > 0 ? variance : 0);
+    
+    // Pass 2: Sigma Clipping ( exclude > mean + 3*std )
+    // This removes the massive spots from the background calculation
+    double robust_sum = 0;
+    long long robust_count = 0;
+    double limit = mean + 3.0 * std_dev;
+    
+    for (int i = 0; i < totalPixels; i++) {
+        if (mask && mask[i] != 0) continue;
+        
+        if (image[i] <= limit) {
+            robust_sum += image[i];
+            robust_count++;
+        }
+    }
+    
+    if (robust_count == 0) return mean * thresfactor;
+    
+    return (robust_sum / robust_count) * thresfactor;
+}
+
+void calculate_radial_profile(double* data, int width, int height, double* radial_mean, double* radial_max, int max_radius) {
+    // efficient radial profile calculation
+    // Reset radial arrays
+    for (int i = 0; i < max_radius; i++) {
+        radial_mean[i] = 0;
+        radial_max[i] = 0;
+    }
+    
+    int *counts = (int*)calloc(max_radius, sizeof(int));
+    
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int dx = x - header.beam_center[0];
+            int dy = y - header.beam_center[1];
+            int r = (int)sqrt(dx*dx + dy*dy);
+            
+            if (r < max_radius) {
+                double val = data[y * width + x];
+                if (val > 0) { // Should we ignore 0/masked?
+                    radial_mean[r] += val;
+                    counts[r]++;
+                    if (val > radial_max[r]) {
+                        radial_max[r] = val;
+                    }
+                }
+            }
+        }
+    }
+    
+    for (int i = 0; i < max_radius; i++) {
+        if (counts[i] > 0) {
+            radial_mean[i] /= counts[i];
+        }
+    }
+    
+    free(counts);
 }
 
 
-void intensityanalysis(double data[], int width, int height) {
+void intensityanalysis(double data[], double max_data[], double* binary_mask, int width, int height, Spot** spots, int* num_spots_ptr) {
+    int num_spots = *num_spots_ptr;
     header.resolution = calculateresolution(header.max_distance);
-    int newSize = (img.height + img.width) / 2;  // Modify the variable name to avoid confusion
-    double max = 10;
-    // double mean = header.postintensity; // This was used for ceiling but postintensity is now spot intensity. 
-    // We should use preintensity (raw avg) or just local calculation for ring detection thresholds.
-    double mean = img.preintensity; 
-    double ceiling = mean * 150;
-
-    // unsigned char circle_color = 255;
-
-    freopen("/dev/null", "w", stderr);
-
-    FILE* data_file = fopen("histogram_data.txt", "w");
-    if (data_file == NULL) {
-        fprintf(stderr, "Error opening temporary data file\n");
-        return;
-    }
-    double sigma = 4;  // Adjust the sigma value as desired
-    applysingulargaussian(data, newSize, sigma);
-
-    if (cfg.gnu){
-        for (int i = 0; i < newSize; i++) {
-            double position = calculateresolution(i);
-            int total = data[i];
-            if (position < max) {
-                fprintf(data_file, "%f %d\n", position, total);
+    int newSize = (img.height + img.width) / 2; 
+    
+    // Improved Ice Detection Logic
+    // Ice rings typically appear at specific resolutions: ~3.67, ~2.25, ~1.92 A (Cubic) or ~3.90, ~2.67, ~2.07 A (Hexagonal)
+    // We will look for significant local maxima in the radial profile
+    
+    // header.ice = 0; // Reset ice flag MOVED to applySPORTA to persist pixel mask flag
+    
+    // Smoothing the radial profile first (simple moving average)
+    int window = 5;
+    double *smoothed = (double*)malloc(newSize * sizeof(double));
+    for(int i=0; i<newSize; i++) {
+        double sum = 0;
+        int count = 0;
+        for(int w=-window; w<=window; w++) {
+            if(i+w >= 0 && i+w < newSize) {
+                sum += data[i+w];
+                count++;
             }
         }
-
-        fclose(data_file);
-
-        FILE* gnuplot_pipe = popen("gnuplot -persist", "w");
-        if (gnuplot_pipe == NULL) {
-            fprintf(stderr, "Error opening Gnuplot pipe\n");
-            return;
-        }
-        fprintf(gnuplot_pipe, "set terminal qt title '%s'\n", cfg.filename);
-        fprintf(gnuplot_pipe, "set title 'Powder X-Ray Diffraction Pattern'\n");
-        fprintf(gnuplot_pipe, "set xlabel 'Resolution [Å]'\n");
-        fprintf(gnuplot_pipe, "set ylabel 'Intensity [8-bit Greyscale]'\n");
-        fprintf(gnuplot_pipe, "set xrange noextend\n");
-        fprintf(gnuplot_pipe, "set style line 1 lt 1 lc rgb 'black' lw 1\n");
-        fprintf(gnuplot_pipe, "plot 'histogram_data.txt' with filledcurves above y=0 ls 1 title 'Intensity'\n");
-        fprintf(gnuplot_pipe, "exit\n");
-        pclose(gnuplot_pipe);
-
-        remove("histogram_data.txt");
+        smoothed[i] = sum/count;
     }
-    double start = -1;
+    
+    // Robust Background Estimation using iterative sigma clipping
+    double bg_mean = 0;
+    double bg_std = 0;
+    int n_points = 0;
+    
+    // Initial pass: collect data in relevant range
+    double *subset = (double*)malloc(newSize * sizeof(double));
+    for(int i=0; i<newSize; i++) {
+        double res = calculateresolution(i);
+        if(res > 1.5 && res < 5.0 && data[i] > 0) {
+             subset[n_points++] = data[i];
+        }
+    }
+    
+    // Iterative clipping
+    if (n_points > 5) {
+        double current_mean, current_std;
+        for (int iter = 0; iter < 3; iter++) {
+            double sum = 0, sum_sq = 0;
+            int count = 0;
+            
+            // Calculate stats
+            if (iter == 0) {
+                for(int i=0; i<n_points; i++) {
+                    sum += subset[i];
+                    sum_sq += subset[i]*subset[i];
+                    count++;
+                }
+            } else {
+                for(int i=0; i<n_points; i++) {
+                    if (abs(subset[i] - bg_mean) < 3.0 * bg_std) {
+                        sum += subset[i];
+                        sum_sq += subset[i]*subset[i];
+                        count++;
+                    }
+                }
+            }
+            
+            if (count < 5) break; 
+            
+            current_mean = sum / count;
+            current_std = sqrt((sum_sq / count) - (current_mean * current_mean));
+            
+            bg_mean = current_mean;
+            bg_std = current_std;
+        }
+    }
+    free(subset);
+
+    // Threshold for general peak detection
+    // Lower multiplier (e.g. 2.0 or 2.5) because we stripped outliers (Bragg peaks)
+    double threshold = bg_mean + 3.0 * bg_std; 
+    if (threshold < bg_mean * 1.2) threshold = bg_mean * 1.2; 
+ 
+
+    // double start = -1; // Removed unused variable
     double position;
 
-    for (int i = 0; i < newSize; i++) {
+    // Detect peaks using the smoothed profile
+    for (int i = 1; i < newSize - 1; i++) {
         position = calculateresolution(i);
-        int total = data[i];
-        if (total > ceiling) {
-            if (start == -1) {
-                start = position;
-            }
-        } else {
-            if (start != -1) {
-                double end = calculateresolution(i - 1);
-                addringset(&positionSets, start, end);
-                start = -1;
-            }
+        
+        // Check if current point is a local maximum and above threshold
+        // And within reasonable ice resolution range
+        // bool is_peak = (smoothed[i] > smoothed[i-1] && smoothed[i] > smoothed[i+1]); // Removed unused variable
+        // bool above_threshold = (smoothed[i] > threshold); // Removed unused variable
+        
+        // Known ice ring resolutions: 
+        // Hexagonal: 3.90, 2.67, 2.07
+        // Cubic: 3.67, 2.25, 1.92
+        // We define ranges around these values
+        bool is_ice_candidate = false;
+        if ((position > 3.85 && position < 3.95) || 
+            (position > 3.62 && position < 3.72) ||
+            (position > 2.62 && position < 2.72) ||
+            (position > 2.20 && position < 2.30) ||
+            (position > 2.02 && position < 2.12) ||
+            (position > 1.87 && position < 1.97)) {
+            is_ice_candidate = true;
+        }
+        
+        // Lower threshold for known ice positions
+        double local_threshold = is_ice_candidate ? (bg_mean + 2.0 * bg_std) : threshold;
+        
+        // Also check max profile for "stretchy spots" / arcs
+        // If max intensity at this radius is significantly higher than mean, it suggests non-uniformity (spots/arcs)
+        // bool strong_max = (max_data[i] > local_threshold * 1.5); // Removed unused variable // Heuristic
+
+    // STRICTER LOGIC: Only flag if it matches known ice resolutions
+    // Bragg spots from sample can appear anywhere, we don't want to flag them as ice unless they overlap with ice rings.
+    
+        if (is_ice_candidate) {
+             // For radial profile, only flag if the MEAN is high, indicating a ring or arc.
+             // Single spots (high max, low mean) are handled by spot analysis below.
+             if (smoothed[i] > local_threshold) {
+                 if(header.ice == 0) header.ice = 1; 
+                 
+                 double width_est = 0.05; 
+                 addringset(&positionSets, position - width_est, position + width_est);
+                 
+                 // Skip neighbors to avoid multiple rings for same peak
+                 i += 2; 
+             }
         }
     }
 
-    if (start != -1) {
-        double end = calculateresolution(newSize - 1);
-        addringset(&positionSets, start, end);
+    // Detect Ice Rings based on Spot Concentration (for weak rings that appear as spots)
+    // Sometimes intensity profile is weak but spots cluster on the ring.
+    int ice_counts[6] = {0}; 
+    // Ranges centers: 3.90, 3.67, 2.67, 2.25, 2.07, 1.92
+    
+    for (int k = 0; k < num_spots; k++) {
+        Spot* s = spots[k];
+        long long sumX = 0, sumY = 0;
+        for(int p=0; p<s->num_pixels; p++) {
+            sumX += s->x_coords[p];
+            sumY += s->y_coords[p];
+        }
+        double avgX = (double)sumX / s->num_pixels; 
+        double avgY = (double)sumY / s->num_pixels; 
+        
+        double dx = avgY - header.beam_center[0];
+        double dy = avgX - header.beam_center[1];
+        double r = sqrt(dx*dx + dy*dy);
+        double pos = calculateresolution(r);
+        
+        // Check ranges (approx +/- 0.05 around known values)
+        if (pos > 3.85 && pos < 3.95) ice_counts[0]++;
+        else if (pos > 3.62 && pos < 3.72) ice_counts[1]++;
+        else if (pos > 2.62 && pos < 2.75) ice_counts[2]++; // slightly wider for 2.67
+        else if (pos > 2.20 && pos < 2.30) ice_counts[3]++;
+        else if (pos > 2.02 && pos < 2.12) ice_counts[4]++;
+        else if (pos > 1.87 && pos < 1.97) ice_counts[5]++;
+    }
+    
+    double centers[6] = {3.90, 3.67, 2.67, 2.25, 2.07, 1.92};
+    for(int i=0; i<6; i++) {
+        if (ice_counts[i] > 10) { // Threshold: >10 spots indicates an ice ring/arc
+             if(header.ice == 0) header.ice = 1; 
+             // Add ring to set for filtering
+             addringset(&positionSets, centers[i] - 0.06, centers[i] + 0.06);
+        }
+    }
+    
+    
+    // FILTER SPOTS ON ICE RINGS
+    if (positionSets != NULL) {
+        int kept_spots = 0;
+        for (int k = 0; k < num_spots; k++) {
+            Spot* s = spots[k];
+            // Calculate resolution of spot center
+            long long sumX = 0, sumY = 0; // Use long long to prevent overflow
+            for(int p=0; p<s->num_pixels; p++) {
+                sumX += s->x_coords[p];
+                sumY += s->y_coords[p];
+            }
+            double avgX = (double)sumX / s->num_pixels; 
+            double avgY = (double)sumY / s->num_pixels; 
+            
+            // Distance from beam center
+            // double dist = sqrt(pow(avgX - header.beam_center[1], 2) + pow(avgY - header.beam_center[0], 2));  
+            // Note: In calculate_radial_profile: dx = x(col) - beam[0], dy=y(row) - beam[1].
+            // x_coords/y_coords in spot are row/col?
+            // In connectedcomponentanalysis: dfs(i, j...) where i is height(row), j is width(col).
+            // dfs stores x_coords[label_count] = i; y_coords[...] = j;
+            // So x_coords is ROW (height), y_coords is COL (width).
+            // header.beam_center[0] is usually X (column?), [1] is Y (row?). 
+            // Check readhdf5: 
+            // beamX_id = "beam_center_x" -> header.beam_center[0]
+            // beamY_id = "beam_center_y" -> header.beam_center[1]
+            // So [0] is col (x), [1] is row (y).
+            // Current code in calculate_radial_profile: dx = x - header.beam_center[0]; dy = y - header.beam_center[1];
+            // correct.
+            // So for Spot: avgX is ROW, avgY is COL.
+            // dx = avgY - header.beam_center[0]; 
+            // dy = avgX - header.beam_center[1];
+            double dx = avgY - header.beam_center[0];
+            double dy = avgX - header.beam_center[1];
+            
+            // Moved logic to end of function
+            double r = sqrt(dx*dx + dy*dy);
+            
+            double resolution = calculateresolution(r);
+            
+            bool on_ice_ring = false;
+            PositionSet* currentSet = positionSets;
+            while (currentSet != NULL) {
+                // Add a small buffer to the range? The range in positionSet is already +/- 0.05
+                if (resolution >= currentSet->startPosition && resolution <= currentSet->endPosition) {
+                    on_ice_ring = true;
+                    break;
+                }
+                currentSet = currentSet->next;
+            }
+            
+            if (!on_ice_ring) {
+                // Hard Filter for standard ice rings (even if not detected by histogram)
+                // Widen tolerance SIGNIFICANTLY to catch "blobs" as reported by user
+                // Standard: 3.90, 3.67, 2.67, 2.25, 2.07, 1.92
+                // Added: 3.44, 1.72, 1.52 (common ice rings)
+                 if ((resolution > 3.80 && resolution < 4.00) || 
+                    (resolution > 3.57 && resolution < 3.77) ||
+                    (resolution > 3.34 && resolution < 3.54) || // 3.44
+                    (resolution > 2.57 && resolution < 2.77) ||
+                    (resolution > 2.15 && resolution < 2.35) ||
+                    (resolution > 1.97 && resolution < 2.17) ||
+                    (resolution > 1.82 && resolution < 2.02) ||
+                    (resolution > 1.62 && resolution < 1.82) || // 1.72
+                    (resolution > 1.42 && resolution < 1.62)) { // 1.52
+                    on_ice_ring = true;
+                    if(header.ice == 0) header.ice = 1; 
+                }
+            }
+
+            if (!on_ice_ring) {
+                // Keep this spot
+                spots[kept_spots] = s;
+                // Debug: Print resolution of kept spots to see what's slipping through
+                // printf("Kept Spot: %.3f A (r=%.1f)\n", resolution, r);
+                kept_spots++;
+            } else {
+                // Reject this spot
+                // printf("Rejected Spot on Ice Ring: %.3f A\n", resolution);
+                
+                // Also clear the pixels in the binary mask so it doesn't show up in the output image!
+                if (binary_mask != NULL) {
+                    for (int p = 0; p < s->num_pixels; p++) {
+                        int px = s->x_coords[p];
+                        int py = s->y_coords[p];
+                        if (px >= 0 && px < height && py >= 0 && py < width) {
+                            // px is row, py is col. image is row-major: row * width + col
+                            binary_mask[px * width + py] = 0.0;
+                        }
+                    }
+                }
+
+                free(s->x_coords);
+                free(s->y_coords);
+                free(s);
+            }
+        }
+        *num_spots_ptr = kept_spots;
+        num_spots = kept_spots; // Update local var for subsequent loops
+        header.num_spots = kept_spots; // Update header too
+    }
+
+    // Double-pass: Hard Filter for standard ice rings (even if not detected by histogram)
+    // This catches any spots/fragments that survived pixel masking (e.g. if center shifted)
+    {
+        int kept_spots = 0;
+        for (int k = 0; k < num_spots; k++) {
+            Spot* s = spots[k];
+             double dx = s->y_coords[s->num_pixels/2] - header.beam_center[0];
+             double dy = s->x_coords[s->num_pixels/2] - header.beam_center[1];
+             double r = sqrt(dx*dx + dy*dy);
+             double resolution = calculateresolution(r);
+             
+             bool on_ice_ring = false;
+             if ((resolution > 3.80 && resolution < 4.00) || // 3.90
+                 (resolution > 3.57 && resolution < 3.77) || // 3.67
+                 (resolution > 3.34 && resolution < 3.54) || // 3.44
+                 (resolution > 2.57 && resolution < 2.77) || // 2.67
+                 (resolution > 2.15 && resolution < 2.35) || // 2.25
+                 (resolution > 1.97 && resolution < 2.17) || // 2.07
+                 (resolution > 1.82 && resolution < 2.05) || // 1.95, 1.92, 1.88
+                 (resolution > 1.78 && resolution < 2.17) || // Overlap safety
+                 (resolution > 1.62 && resolution < 1.82) || // 1.72
+                 (resolution > 1.42 && resolution < 1.62)) { // 1.52
+                 on_ice_ring = true;
+                 if(header.ice == 0) header.ice = 1;
+             }
+             
+             if (!on_ice_ring) {
+                 spots[kept_spots] = s;
+                 kept_spots++;
+             } else {
+                 free(s->x_coords);
+                 free(s->y_coords);
+                 free(s);
+             }
+        }
+        *num_spots_ptr = kept_spots;
+        num_spots = kept_spots;
+        header.num_spots = kept_spots;
+    }
+    
+
+    // Debug output status
+    // printf("DEBUG: header.ice=%d, positionSets=%p\n", header.ice, (void*)positionSets);
+
+
+    // Analyze detected spots for "stretchy" ice spots
+    for (int k = 0; k < num_spots; k++) {
+        Spot* s = spots[k];
+        double sumX = 0, sumY = 0;
+        int min_x = 10000, max_x = 0;
+        int min_y = 10000, max_y = 0;
+        
+        for(int p=0; p<s->num_pixels; p++) {
+            sumX += s->x_coords[p];
+            sumY += s->y_coords[p];
+            if(s->x_coords[p] < min_x) min_x = s->x_coords[p];
+            if(s->x_coords[p] > max_x) max_x = s->x_coords[p];
+            if(s->y_coords[p] < min_y) min_y = s->y_coords[p];
+            if(s->y_coords[p] > max_y) max_y = s->y_coords[p];
+        }
+        
+        double avgX = sumX / s->num_pixels;
+        double avgY = sumY / s->num_pixels;
+        
+        // Calculate resolution of spot center
+        // double dx = avgX - header.beam_center[1]; // Removed unused variable // x is row/height? verify coordinate system. header has beam_center in [0]=X(row?), [1]=Y(col?). 
+        // In drawcircle: image[x*width + y]. x is row. header.beam_center[1] is passed as center_x.
+        // HDF5 header usually: [0]=X, [1]=Y.
+        // main code: dist = sqrt(pow(header.beam_center[0] - j, 2) + pow(header.beam_center[1] - i, 2)); i=row, j=col.
+        // So [0] is col (j), [1] is row (i)? 
+        // Let's rely on distance calculation from connectedcomponentanalysis:
+        // dist = sqrt(pow(header.beam_center[0] - j, 2) + pow(header.beam_center[1] - i, 2));
+        // So [0] <-> j (width/col), [1] <-> i (height/row).
+        
+        // s->x_coords are from `dfs(x, y...) -> pixels[...] = x`. x was i (row).
+        // s->y_coords are y (col).
+        
+        double dist = sqrt(pow(header.beam_center[1] - avgX, 2) + pow(header.beam_center[0] - avgY, 2));
+        double position = calculateresolution(dist);
+        
+        // Check if resolution matches ice
+         bool is_ice_res = false;
+         if ((position > 3.85 && position < 3.95) || 
+            (position > 3.62 && position < 3.72) ||
+            (position > 2.62 && position < 2.75) || // widened slightly
+            (position > 2.20 && position < 2.30) ||
+            (position > 2.02 && position < 2.12) ||
+            (position > 1.87 && position < 1.97)) {
+            is_ice_res = true;
+        }
+        
+        if (is_ice_res) {
+            // Check shape
+            double width_box = max_y - min_y + 1;
+            double height_box = max_x - min_x + 1;
+            double aspect = (width_box > height_box) ? width_box / height_box : height_box / width_box;
+            
+            // Criteria for "stretchy" or large spot
+            // Normal spots are roughly circular (aspect ~1.0-1.5) and small.
+            // Stretchy spots: aspect > 2.0?
+            // Large spots: num_pixels > 60 (we increased limit to 2000)
+            
+            // Require minimum size for aspect ratio check to avoid 3x1 pixel noise
+            if (s->num_pixels > 60 || (s->num_pixels > 10 && aspect > 1.8)) {
+                if(header.ice == 0) header.ice = 1;
+                 double width_est = 0.05; 
+                 addringset(&positionSets, position - width_est, position + width_est);
+            }
+        }
+    }
+    
+    free(smoothed);    
+
+    if (cfg.gnu){
+        FILE* data_file = fopen("histogram_data.txt", "w");
+         if (data_file != NULL) {
+            for (int i = 0; i < newSize; i++) {
+                double pos = calculateresolution(i);
+                if (pos < 10.0) { // Limit plot range
+                    fprintf(data_file, "%f %f\n", pos, data[i]);
+                }
+            }
+            fclose(data_file);
+
+            FILE* gnuplot_pipe = popen("gnuplot -persist", "w");
+            if (gnuplot_pipe != NULL) {
+                fprintf(gnuplot_pipe, "set terminal qt title '%s'\n", cfg.filename);
+                fprintf(gnuplot_pipe, "set title 'Radial Profile'\n");
+                fprintf(gnuplot_pipe, "set xlabel 'Resolution [Å]'\n");
+                fprintf(gnuplot_pipe, "set ylabel 'Intensity'\n");
+                fprintf(gnuplot_pipe, "plot 'histogram_data.txt' with lines title 'Radial Profile', %f title 'Threshold'\n", threshold);
+                fprintf(gnuplot_pipe, "exit\n");
+                pclose(gnuplot_pipe);
+            }
+            remove("histogram_data.txt");
+        }
     }
 }
 
 
-void dfs(int x, int y, int current_label, int height, int width, double *image, int* num_pixels, int* pixels) {
-    if (x < 0 || x >= height || y < 0 || y >= width || image[x * width + y] != 1 || *num_pixels > 65) {
+// Helper function to clear pixels in known ice ring resolutions AND beam center
+void apply_pixel_masks(double* binary_mask, int width, int height) {
+    // Iterate over all pixels
+    // 1. Ice Rings: If resolution matches ice ring, set binary_mask to 0
+    // 2. Beam Center: If pixel is within 70 pixels of beam center, set to 0
+    
+    // Beam Center radius squared for fast comparison
+    double beam_radius_sq = 70.0 * 70.0;
+
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            // Calculate distance from beam center
+             double dx = j - header.beam_center[0];
+             double dy = i - header.beam_center[1];
+             double r_sq = dx*dx + dy*dy;
+             
+             // 1. Beam Center Mask
+             if (r_sq < beam_radius_sq) {
+                 binary_mask[i*width + j] = 0.0;
+                 continue; // Skip ice check if already masked
+             }
+
+             double r = sqrt(r_sq);
+             double resolution = calculateresolution(r);
+             
+             // 2. Ice Ring Mask
+             // Check against known ice rings with +/- 0.10 A tolerance
+             // List: 3.90, 3.67, 3.44, 2.67, 2.25, 2.07, 1.95, 1.92, 1.88, 1.72, 1.52
+             if ((resolution > 3.80 && resolution < 4.00) || // 3.90
+                 (resolution > 3.57 && resolution < 3.77) || // 3.67
+                 (resolution > 3.34 && resolution < 3.54) || // 3.44
+                 (resolution > 2.57 && resolution < 2.77) || // 2.67
+                 (resolution > 2.15 && resolution < 2.35) || // 2.25
+                 (resolution > 1.97 && resolution < 2.17) || // 2.07
+                 (resolution > 1.82 && resolution < 2.05) || // 1.95, 1.92, 1.88
+                 (resolution > 1.78 && resolution < 2.17) || // Overlap safety
+                 (resolution > 1.62 && resolution < 1.82) || // 1.72
+                 (resolution > 1.42 && resolution < 1.62)) { // 1.52
+                 
+                 // Mark pixel as 0
+                 binary_mask[i*width + j] = 0.0;
+                 if(header.ice == 0) header.ice = 1;
+             }
+        }
+    }
+}
+
+
+void dfs(int x, int y, int current_label, int height, int width, double *image, int* num_pixels, int* pixels, int limit) {
+    if (x < 0 || x >= height || y < 0 || y >= width || image[x * width + y] != 1 || *num_pixels > limit) {
         return;
     }
 
@@ -546,19 +1024,27 @@ void dfs(int x, int y, int current_label, int height, int width, double *image, 
 
     // Visit the neighbors
     for (int direction = 0; direction < 4; direction++) {
-        dfs(x + dx[direction], y + dy[direction], current_label, height, width, image, num_pixels, pixels);
+        dfs(x + dx[direction], y + dy[direction], current_label, height, width, image, num_pixels, pixels, limit);
     }
 }
 
 Spot** connectedcomponentanalysis(int height, int width, double *image, double *data, double *preradial, double *postradial, int* num_spots) {
-    int next_label = 0;
-    int min_pixel = 4;
-    int max_pixel = 60;
+    int next_label = 2; // Start at 2 to avoid conflict with 1 (binary mask) and 0 (background)
+    int min_pixel = cfg.min_pixel_size;
+    int max_pixel = 2000; // Increased to allow for large "stretchy" ice spots
     Spot** spots = NULL;
     int max_spots = 0;
+    // int total_blobs = 0; // Removed unused variable
+    // int total_blobs = 0; // Removed unused variable
+    // int rejected_small = 0; // Removed unused variable
+    // int rejected_large = 0; // Removed unused variable
+    // int rejected_scd = 0; // Removed unused variable
+    // int accepted = 0; // Removed unused variable
+
     for (int i = 0; i < height; i++) {
         for (int j = 0; j < width; j++) {
             if (image[i * width + j] == 1) {
+                // total_blobs++; // Removed unused variable
                 int distance = (int) sqrt(pow(header.beam_center[0] - j, 2) + pow(header.beam_center[1] - i, 2));
                 int current_label = next_label;
                 int num_pixels = 0;
@@ -566,7 +1052,7 @@ Spot** connectedcomponentanalysis(int height, int width, double *image, double *
                 int* pixels = malloc(height * width * 2 * sizeof(double));
                 bool scdcondition = false;
                 int encounter = 0;
-                dfs(i, j, current_label, height, width, image, &num_pixels, pixels);
+                dfs(i, j, current_label, height, width, image, &num_pixels, pixels, max_pixel);
                 for (int q = -cfg.proximity; q <= cfg.proximity; q++) {
                     for (int w = -cfg.proximity; w <= cfg.proximity; w++) {
                         int checkX = q + i;
@@ -585,7 +1071,15 @@ Spot** connectedcomponentanalysis(int height, int width, double *image, double *
                         break;
                     }
                 }
-                if (!scdcondition && num_pixels >= min_pixel && num_pixels <= max_pixel) {
+                
+                // if (scdcondition) rejected_scd++;
+                // else if (num_pixels < min_pixel) rejected_small++;
+                // else if (num_pixels > max_pixel) rejected_large++;
+                // else accepted++;
+                
+                // Allow neighboring spots (disable scdcondition rejection)
+                // if (!scdcondition && num_pixels >= min_pixel && num_pixels <= max_pixel) {
+                if (num_pixels >= min_pixel && num_pixels <= max_pixel) {
                     if (postradial[distance] == 0){
                         postradial[distance] = data[i * width + j];
                     }
@@ -613,6 +1107,12 @@ Spot** connectedcomponentanalysis(int height, int width, double *image, double *
             }
         }
     }
+    // printf("\nDEBUG Spot Detection Stats:\n");
+    // printf("Total blobs found: %d\n", total_blobs);
+    // printf("Rejected (Small < %d): %d\n", min_pixel, rejected_small);
+    // printf("Rejected (Large > %d): %d\n", max_pixel, rejected_large);
+    // printf("Rejected (Neighbor Conflict SCD): %d\n", rejected_scd);
+    // printf("Accepted: %d\n\n", accepted);
     return spots;
 }
 
@@ -695,6 +1195,16 @@ void optics(Spot** spots, int num_spots, double epsilon, unsigned int minPts) {
     }
 }
 
+// Comparison function for qsort (Descending Angstroms: High -> Low)
+// So index 0 = worst resolution (large A), index 95% = near best (small A)
+int compare_doubles(const void* a, const void* b) {
+    double arg1 = *(const double*)a;
+    double arg2 = *(const double*)b;
+    if (arg1 < arg2) return 1; // Descending
+    if (arg1 > arg2) return -1;
+    return 0;
+}
+
 void plot3DImage(Spot** spots, int width, int height) {
     FILE* data_file = fopen("image_data.txt", "w");
     if (data_file == NULL) {
@@ -744,10 +1254,15 @@ void plot3DImage(Spot** spots, int width, int height) {
 
 void applySPORTA(double* image, double* data, int height, int width){
     int num_spots = 0;
+    header.ice = 0; // Initialize ice flag here
     double radial[img.height + img.width], postradial[img.height + img.width];
     
     // We remove the old binary mask intensity calculation that resulted in 0.00
     // header.postintensity = calculateavgintensity(img.data, width, height, 1);
+    
+    // Clear ice rings and beam center from binary mask BEFORE spot detection
+    // This ensures "streaky" spots or blobs on ice rings are never detected in the first place
+    apply_pixel_masks(image, width, height);
     
     Spot** spots = connectedcomponentanalysis(height, width, image, data, radial, postradial, &num_spots);
     header.num_spots = num_spots;
@@ -769,6 +1284,10 @@ void applySPORTA(double* image, double* data, int height, int width){
 
     double totalintensity = 0; // Use double for intensity
 
+    // Array to store resolutions for 95% calculation
+    double* spot_resolutions = (double*)malloc(num_spots * sizeof(double));
+    int res_count = 0;
+
     for (int i = 0; i < num_spots; i++) {
         int totalX = 0;
         int totalY = 0;
@@ -784,17 +1303,53 @@ void applySPORTA(double* image, double* data, int height, int width){
         int aX = (int)(totalX / num);
         int aY = (int)(totalY / num);
         if (spots[i]->cluster_id == 0) {
-            double spot_distance_from_center = sqrt(pow(header.beam_center[1] - aX, 2) + pow(header.beam_center[0] - aY, 2));
-            if (spot_distance_from_center > max_distance_from_center) {
-                max_distance_from_center = spot_distance_from_center;
+            // double spot_distance_from_center = sqrt(pow(header.beam_center[1] - aX, 2) + pow(header.beam_center[0] - aY, 2));
+            // if (spot_distance_from_center > max_distance_from_center) {
+            //    max_distance_from_center = spot_distance_from_center;
                 // furthest_spot = spots[i];
-            }
+            // }
         }
+        
+        // Calculate distance for ALL spots regardless of cluster_id
+        double spot_distance_from_center = sqrt(pow(header.beam_center[1] - aX, 2) + pow(header.beam_center[0] - aY, 2));
+        if (spot_distance_from_center > max_distance_from_center) {
+            max_distance_from_center = spot_distance_from_center;
+        }
+
+        // Store resolution for percentile calculation
+        // We can reuse the `radial` array momentarily or alloc new one? 
+        // Alloc new one is safer.
+        // Wait, we need to collect ALL resolutions to sort.
+        // Let's do it after the loop if we store them.. but we don't store them in spots struct?
+        // Spots struct has x_coords/y_coords arrays.
+        // We can calculate resolution here and store in a dynamic array.
+
 
         if (cfg.output){
             filespot(spots[i], aX, aY, file);
             drawcircle(image, 10, width, height, aX, aY, circle_color);
         }
+        
+        // Store resolution
+        // Calculate resolution from distance
+        // r = distance
+        // resolution = lambda / (2 * sin(0.5 * atan(r * pixel_size / distance)))
+        // Use existing calculateresolution function? Yes.
+        double r = spot_distance_from_center;
+        if (spot_resolutions) {
+            spot_resolutions[res_count++] = calculateresolution(r);
+        }
+    }
+    
+    // Calculate 95th Percentile Resolution
+    // Sort resolutions descending (High Å -> Low Å). Index 95% = near-best resolution.
+    header.resolution_95 = 0.0;
+    if (spot_resolutions && res_count > 0) {
+        qsort(spot_resolutions, res_count, sizeof(double), compare_doubles);
+        int idx95 = (int)(0.95 * res_count);
+        if (idx95 >= res_count) idx95 = res_count - 1;
+        header.resolution_95 = spot_resolutions[idx95];
+        free(spot_resolutions);
     }
     
     // Update header postintensity to be Avg Spot Intensity
@@ -808,57 +1363,94 @@ void applySPORTA(double* image, double* data, int height, int width){
     header.intensity = totalintensity;
     
     header.snr = log10(header.num_spots / img.preintensity);
-    header.max_distance = max_distance_from_center * 0.95;
+    // Adjusted max_distance calculation without 0.95 factor
+    header.max_distance = max_distance_from_center; 
+    if (header.max_distance <= 0) header.max_distance = 1.0; // Avoid potential issues with 0 radius
+
     if (cfg.output){
-        drawcircle(image, max_distance_from_center * 0.95, width, height, header.beam_center[1], header.beam_center[0], circle_color);
+        drawcircle(image, header.max_distance, width, height, header.beam_center[1], header.beam_center[0], circle_color);
     }
-    intensityanalysis(radial, width, height);
-    //plot3DImage(spots, width, height);
+    
+    // Calculate Radial Profile
+    // int max_radius = (img.height > img.width) ? img.height : img.width; // Removed unused variable 
+    // Usually diagonals are larger, but let's be safe with buffer size equal to max dim or diagonal
+    // The previous code seemed to use (h+w)/2 which is odd, let's stick to diagonal for safety
+    int diagonal = (int)sqrt(width*width + height*height) + 1;
+    // Re-allocate localized radial arrays to ensure size correctness
+    // Note: The original code used variable length array on stack (VLA) which can stack overflow for large images
+    // double radial[img.height + img.width] is risky.
+    // Let's use heap allocation.
+    
+    double *safe_radial = (double*)malloc(diagonal * sizeof(double));
+    double *safe_radial_max = (double*)malloc(diagonal * sizeof(double));
+    
+    if (safe_radial && safe_radial_max) {
+        calculate_radial_profile(data, width, height, safe_radial, safe_radial_max, diagonal);
+        // Pass 'image' (which is img.data, the binary mask) to be updated
+        intensityanalysis(safe_radial, safe_radial_max, image, width, height, spots, &num_spots);
+        free(safe_radial);
+        free(safe_radial_max);
+    } else {
+        // Fallback or error
+        if(safe_radial) free(safe_radial);
+        if(safe_radial_max) free(safe_radial_max);
+        printf("Error allocating memory for radial profile.\n");
+    }
+    // plot3DImage(spots, width, height);
     fclose(file); 
     free(spots);
 }
 
 
-void applythreshold(double* image, double* data, int width, int height) {
-    int histogram[256] = {0};
-    for (int i = 0; i < height * width; ++i) {
-        int pixelValue = (int)image[i];
-        if (pixelValue >= 0 && pixelValue <= 255) {
-            histogram[pixelValue]++;
-        }
-    }
-
-    int cumulative[256] = {0};
-    cumulative[0] = histogram[0];
-    for (int i = 1; i < 256; ++i) {
-        cumulative[i] = cumulative[i - 1] + histogram[i];
-    }
-    // Calculate the total number of pixels
-    int totalPixels = height * width;
-
-    double threshold = 0.0;
-    double w1 = (double)cumulative[1] / totalPixels;
-    double w2 = 1.0 - w1;
-
-    double sum1 = 0.0;
-    for (int j = 0; j <= 1; ++j) {
-        sum1 += j * histogram[j];
-    }
-    threshold = sum1 / (w1 * cumulative[1]);
-
-    double sum2 = 0.0;
-    for (int j = 2; j < 256; ++j) {
-        sum2 += j * histogram[j];
-    }
-    threshold += sum2 / (w2 * (totalPixels - cumulative[1]));
-    threshold *= cfg.thresfactor;
+void applythreshold(double* image, double* data, int* mask, int width, int height) {
+    // Note: Histogram calculation for Otsu might need update to ignore mask, 
+    // but here we use 'threshold' from header which is set by this function?
+    // Wait, applythreshold calculates the threshold using Otsu logic on 'image' (which is blurred)
+    // The previous logic was:
+    // ... calculate Otsu ...
+    // then override threshold with header.threshold = threshold * thresfactor
+    // But 'calculateavgintensity' sets 'img.preintensity' which is used for SNR, 
+    // it does NOT set 'header.threshold'.
+    // Actually, 'applythreshold' calculates the threshold.
+    // AND 'calculateavgintensity' is called BEFORE 'applythreshold'.
+    
+    // The user wants 'weak spots'.
+    // Otsu on diffraction images is tricky because background > foreground pixels.
+    // The previous 'calculateavgintensity' returned a value.
+    // Let's use THAT value as the threshold base instead of Otsu?
+    // Or improve Otsu?
+    // The code currently does:
+    
+    // 1. img.preintensity = calculateavgintensity(...) -> robust mean
+    // 2. applygaussianblur
+    // 3. applythreshold -> calculates Otsu on BLURRED image, then sets header.threshold.
+    
+    // User complaint: "image background is set too high".
+    // This implies the threshold calculated HERE is too high.
+    // Otsu tries to separate background from foreground (spots).
+    // If spots are sparse, Otsu might fail or set threshold too high if bimodality is weak?
+    // actually, for sparse spots, Otsu often sets threshold too LOW (just above background noise).
+    // If the user says it's too high, maybe the "background" peak is wide?
+    
+    // PROPOSAL:
+    // Use the robust mean from 'calculateavgintensity' as the threshold base!
+    // Simply: threshold = img.preintensity (which already includes thresfactor).
+    // This gives direct control via -t flag and uses the robust background.
+    
+    double threshold = img.preintensity; // Already has thresfactor applied
     header.threshold = threshold;
-    // Apply the multi-otsu thresholds
+
     for (int i = 0; i < height * width; ++i) {
+        // Apply Mask - DISABLED to see if it removes valid saturated spots
+        // if (mask && mask[i] != 0) {
+        //    image[i] = 0.0;
+        //    continue;
+        // }
+        
         int pixelValue = (int)image[i];
 
-        // If the pixel intensity is greater than the threshold and less than 1000, set it to 1
-        if (pixelValue > threshold && pixelValue < 1000) {
+        // If the pixel intensity is greater than the threshold
+        if (pixelValue > threshold) {
             image[i] = 1.0;
         }
         // Otherwise, set it to 0
@@ -986,21 +1578,10 @@ void setdefault(){
     header.beam_center[1] = 1577;
 }
 
-int ends_with_data(const char *path, char *folder) {
-    char *last_slash = strrchr(path, '/');
-    if (last_slash != NULL && strcmp(last_slash + 1, folder) == 0) {
-        return 1;
-    }
-    return 0;
-}
-
-int contains_proc(const char *name) {
-    return strstr(name, "proc") != NULL;
-}
-
-int contains_native(const char *name) {
-    return strstr(name, "native") != NULL;
-}
+// ends_with_data, contains_proc, contains_native - commented out as unused
+// int ends_with_data(const char *path, char *folder) { return 0; }
+// int contains_proc(const char *name) { return strstr(name, "proc") != NULL; }
+// int contains_native(const char *name) { return strstr(name, "native") != NULL; }
 
 int screener(const char *filename){
     cfg.filename = (char*)filename; // Ensure global is in sync if needed elsewhere
@@ -1077,15 +1658,17 @@ int screener(const char *filename){
     img.height = (int)header.size[0];
     img.width = (int)header.size[1];
     img.data = deepcopyimage(data, img.width, img.height);
-    img.preintensity = calculateavgintensity(data, img.width, img.height, 1);
+    img.preintensity = calculateavgintensity(data, img.mask, img.width, img.height, cfg.thresfactor);
     applygaussianblur(img.data, img.width, img.height);
-    applythreshold(img.data, data, img.width, img.height);
+    applythreshold(img.data, data, img.mask, img.width, img.height);
     applySPORTA(img.data, data, img.width, img.height);
     if (cfg.output){
         savepgm("pre-output", data, img.height, img.width);
         savepgm("post-output", img.data, img.height, img.width);
     }
     mainprint();
+    mainprint();
+    if(img.mask) free(img.mask);
     free(data);
     free(img.data);
 
@@ -1112,79 +1695,7 @@ int matches_pattern(const char *filename) {
     }
 }
 
-int getrecentfile(const char *dirname) {
-    //printf("Processing file: %s\n", dirname);
-    DIR *dir;
-    struct dirent *ent;
-    if ((dir = opendir(dirname)) != NULL) {
-        while ((ent = readdir(dir)) != NULL) {
-            if (ent->d_type == DT_REG) {
-                char *filename = ent->d_name;
-                if (matches_pattern(filename)) {
-                    char filepath[1024];
-                    snprintf(filepath, sizeof(filepath), "%s/%s", dirname, filename);
-                    //printf("Processing file: %s\n", filepath);
-                    cfg.filename = filepath;
-                    screener(filepath);  // Process each file as it's found
-                }
-            }
-        }
-        closedir(dir);
-    } else {
-        perror("Could not open directory");
-    }
-    return 0;
-}
-
-
-void free_memory(char** dirs, int count) {
-    for (int i = 0; i < count; i++) {
-        free(dirs[i]);
-    }
-    free(dirs);
-}
-
-char** getdirs(const char* currentdir, char* folder, int* count) {
-    struct dirent* dir_entry;
-    DIR* dir = opendir(currentdir);
-
-    if (dir == NULL) {
-        perror("Unable to read directory");
-        return NULL;
-    }
-
-    char** directories = NULL;
-    *count = 0;
-
-    while ((dir_entry = readdir(dir)) != NULL) {
-        if (dir_entry->d_type == DT_DIR) {
-            if (strcmp(dir_entry->d_name, ".") == 0 || strcmp(dir_entry->d_name, "..") == 0)
-                continue;
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/%s", currentdir, dir_entry->d_name);
-            
-            if (ends_with_data(path, folder) && !contains_proc(path) && !contains_native(path)) {
-               // printf("Processing directory: %s\n", path);
-                (*count)++;
-                directories = realloc(directories, sizeof(char*) * (*count));
-                directories[*count - 1] = strdup(path);
-            }
-
-            // Call getdirs after incrementing count and adding to the array
-            int child_count = 0;
-            char** child_directories = getdirs(path, folder, &child_count);
-            if (child_directories != NULL) {
-                directories = realloc(directories, sizeof(char*) * (*count + child_count));
-                memcpy(directories + *count, child_directories, sizeof(char*) * child_count);
-                *count += child_count;
-                free(child_directories);  // remember to free child_directories after use
-            }
-        }
-    }
-
-    closedir(dir);
-    return directories;
-}
+// (getrecentfile, free_memory, getdirs functions removed - unused)
 
 
 int argparse(int argc, char **argv) {
@@ -1199,10 +1710,11 @@ int argparse(int argc, char **argv) {
     cfg.traversing = 0;  
     cfg.searchdir = "data";
     cfg.gnu = false;
+    cfg.min_pixel_size = 5; // Default to 5 as requested
     header.ice = 0;
     int c;
 
-    while ((c = getopt(argc, argv, "hof:i:d:t:s:rp:g:")) != -1) {
+    while ((c = getopt(argc, argv, "hof:i:d:t:s:rp:g:m:")) != -1) {
         switch (c) {
             case 'h':
                 printf("Usage: ./imager -f <filepath> -o\n");
@@ -1218,6 +1730,7 @@ int argparse(int argc, char **argv) {
                 printf("  -e <value>  Set the ring exclusion proximity radius\n");
                 printf("  -p          Enable histogram through GNUPLOT\n");
                 printf("  -g <sigma>  Set gaussian filtering sigma value\n");
+                printf("  -m <value>  Set minimum pixel size for spots (default: 5)\n");
                 printf("  -n          Display the notes, tips, and comments");
                 return(0);
             case 'd':
@@ -1249,6 +1762,9 @@ int argparse(int argc, char **argv) {
                 break;
             case 'f':
                 cfg.filename = optarg;
+                break;
+            case 'm':
+                cfg.min_pixel_size = atoi(optarg);
                 break;  
             case 'n':
                 noteprint();

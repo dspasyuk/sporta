@@ -66,31 +66,26 @@ class Hdf5Header(ctypes.Structure):
         ("ice", ctypes.c_int),
         ("max_distance", ctypes.c_double),
         ("snr", ctypes.c_double),
-        ("postintensity", ctypes.c_double)
+        ("postintensity", ctypes.c_double),
+        ("resolution_95", ctypes.c_double),
     ]
 
-lib.getdirs.restype = ctypes.POINTER(ctypes.c_char_p)
-lib.getdirs.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
-
-lib.getrecentfile.restype = ctypes.c_int
-lib.getrecentfile.argtypes = [ctypes.c_char_p]
-
-lib.free_memory.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.c_int]
 
 lib.getheaderdata.restype = Hdf5Header 
 
 def getdirs(currentdir, folder):
-    count = ctypes.c_int()
-    result = lib.getdirs(currentdir.encode(), folder.encode(), ctypes.byref(count))
-    dirs = [result[i].decode() for i in range(count.value)]
-    lib.free_memory(result, count)
-    
-    return dirs
+    """Pure-Python directory finder (C version was removed as unused)."""
+    import os
+    results = []
+    for root, dirs, files in os.walk(currentdir):
+        if os.path.basename(root) == folder and 'proc' not in root and 'native' not in root:
+            results.append(root)
+    return results
 
 lib.screener.restype = ctypes.c_int
 lib.screener.argtypes = [ctypes.c_char_p]
 
-def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, output=False):
+def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, min_pixel=5, output=False):
     """
     Process a single HDF5 file or master file.
     
@@ -100,6 +95,7 @@ def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, out
         threshold (float): Threshold scale factor (default: 6).
         proximity (float): Ring exclusion proximity radius (default: 2).
         gaussian (float): Gaussian sigma (optional).
+        min_pixel (int): Minimum pixel size for spots (default: 5).
         output (bool): Whether to save intermediate PGM images (default: False).
         
     Returns:
@@ -117,6 +113,7 @@ def process_file(filename, index=1, threshold=6, proximity=2, gaussian=None, out
     args.extend(["-i", str(index)])
     if gaussian is not None:
         args.extend(["-g", str(gaussian)])
+    args.extend(["-m", str(min_pixel)])
     if output:
         args.append("-o")
         
@@ -159,6 +156,7 @@ def print_help():
     print("  -t <value>  Set the threshold scale factor (default: 6)")
     print("  -e <value>  Set the ring exclusion proximity radius (default: 2)")
     print("  -g <sigma>  Set the Gaussian filtering sigma value")
+    print("  -m <size>   Set the minimum pixel size for spots (default: 5)")
     print("  -o          Enable intermediate image output")
     print("\nExamples:")
     print("  sporta -v data.h5")
@@ -215,7 +213,7 @@ def main():
         # Skip values for other flags to avoid double adding
         if arg.startswith('-'):
             # These flags take an argument
-            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g']:
+            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g', '-m']:
                 if i + 1 < argc:
                     filtered_args.append(args[i+1])
                     i += 2
@@ -236,7 +234,7 @@ def main():
     while i < len(filtered_args):
         arg = filtered_args[i]
         if arg.startswith('-'):
-            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g']:
+            if arg in ['-f', '-i', '-d', '-t', '-s', '-e', '-g', '-m']:
                 i += 2
             else:
                 i += 1

@@ -1,6 +1,6 @@
 CC = gcc
-HDF5_HOME = /home/denis/gsas2main
-CFLAGS = -Wall -Werror -I$(HDF5_HOME)/include
+HDF5_INCLUDE = /usr/include/hdf5/serial
+CFLAGS = -Wall -Werror -I$(HDF5_INCLUDE) -fPIC
 SRCS = bshuf_h5filter.c bitshuffle.c bitshuffle_core.c iochain.c lz4.c
 OBJS = $(SRCS:.c=.o)
 TARGET = libbitshuffle.a
